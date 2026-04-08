@@ -21,12 +21,29 @@ const CLOB    = "https://clob.polymarket.com";
 const POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 const STATIONS = [
-  { city:"New York",    country:"US", stationId:"KLGA", stationName:"LaGuardia Airport",  lat:40.7769,  lon:-73.8740,  tz:"America/New_York",    unit:"F" },
-  { city:"London",      country:"UK", stationId:"EGLC", stationName:"London City Airport", lat:51.5048,  lon:0.0495,    tz:"Europe/London",       unit:"C" },
-  { city:"Miami",       country:"US", stationId:"KMIA", stationName:"Miami Intl Airport",  lat:25.7959,  lon:-80.2870,  tz:"America/New_York",    unit:"F" },
-  { city:"Chicago",     country:"US", stationId:"KORD", stationName:"OHare Airport",       lat:41.9742,  lon:-87.9073,  tz:"America/Chicago",     unit:"F" },
-  { city:"Los Angeles", country:"US", stationId:"KLAX", stationName:"LAX Airport",         lat:33.9425,  lon:-118.4081, tz:"America/Los_Angeles", unit:"F" },
-  { city:"Hong Kong",   country:"HK", stationId:"VHHH", stationName:"HK Intl Airport",     lat:22.3089,  lon:113.9149,  tz:"Asia/Hong_Kong",      unit:"C" },
+  // US Cities
+  { city:"New York",     country:"US", stationId:"KLGA", stationName:"LaGuardia Airport",      lat:40.7769,  lon:-73.8740,  tz:"America/New_York",    unit:"F" },
+  { city:"Miami",        country:"US", stationId:"KMIA", stationName:"Miami Intl Airport",      lat:25.7959,  lon:-80.2870,  tz:"America/New_York",    unit:"F" },
+  { city:"Chicago",      country:"US", stationId:"KORD", stationName:"OHare Airport",           lat:41.9742,  lon:-87.9073,  tz:"America/Chicago",     unit:"F" },
+  { city:"Los Angeles",  country:"US", stationId:"KLAX", stationName:"LAX Airport",             lat:33.9425,  lon:-118.4081, tz:"America/Los_Angeles", unit:"F" },
+  { city:"Houston",      country:"US", stationId:"KIAH", stationName:"Houston Intercontinental", lat:29.9902,  lon:-95.3368,  tz:"America/Chicago",     unit:"F" },
+  { city:"Dallas",       country:"US", stationId:"KDFW", stationName:"Dallas Fort Worth",       lat:32.8998,  lon:-97.0403,  tz:"America/Chicago",     unit:"F" },
+  { city:"Phoenix",      country:"US", stationId:"KPHX", stationName:"Phoenix Sky Harbor",      lat:33.4373,  lon:-112.0078, tz:"America/Phoenix",     unit:"F" },
+  { city:"Seattle",      country:"US", stationId:"KSEA", stationName:"Seattle Tacoma Airport",  lat:47.4502,  lon:-122.3088, tz:"America/Los_Angeles", unit:"F" },
+  { city:"Atlanta",      country:"US", stationId:"KATL", stationName:"Hartsfield Atlanta",      lat:33.6407,  lon:-84.4277,  tz:"America/New_York",    unit:"F" },
+  { city:"Boston",       country:"US", stationId:"KBOS", stationName:"Logan International",     lat:42.3656,  lon:-71.0096,  tz:"America/New_York",    unit:"F" },
+  // Europe
+  { city:"London",       country:"UK", stationId:"EGLC", stationName:"London City Airport",    lat:51.5048,  lon:0.0495,    tz:"Europe/London",       unit:"C" },
+  { city:"Paris",        country:"FR", stationId:"LFPO", stationName:"Paris Orly Airport",      lat:48.7262,  lon:2.3652,    tz:"Europe/Paris",        unit:"C" },
+  { city:"Berlin",       country:"DE", stationId:"EDDB", stationName:"Berlin Brandenburg",      lat:52.3667,  lon:13.5033,   tz:"Europe/Berlin",       unit:"C" },
+  { city:"Amsterdam",    country:"NL", stationId:"EHAM", stationName:"Schiphol Airport",        lat:52.3105,  lon:4.7683,    tz:"Europe/Amsterdam",    unit:"C" },
+  { city:"Madrid",       country:"ES", stationId:"LEMD", stationName:"Barajas Airport",         lat:40.4983,  lon:-3.5676,   tz:"Europe/Madrid",       unit:"C" },
+  // Asia / Pacific
+  { city:"Hong Kong",    country:"HK", stationId:"VHHH", stationName:"HK Intl Airport",        lat:22.3089,  lon:113.9149,  tz:"Asia/Hong_Kong",      unit:"C" },
+  { city:"Tokyo",        country:"JP", stationId:"RJTT", stationName:"Tokyo Haneda Airport",    lat:35.5533,  lon:139.7811,  tz:"Asia/Tokyo",          unit:"C" },
+  { city:"Singapore",    country:"SG", stationId:"WSSS", stationName:"Changi Airport",          lat:1.3644,   lon:103.9915,  tz:"Asia/Singapore",      unit:"C" },
+  { city:"Sydney",       country:"AU", stationId:"YSSY", stationName:"Sydney Kingsford Smith",  lat:-33.9461, lon:151.1772,  tz:"Australia/Sydney",    unit:"C" },
+  { city:"Dubai",        country:"AE", stationId:"OMDB", stationName:"Dubai International",     lat:25.2528,  lon:55.3644,   tz:"Asia/Dubai",          unit:"C" },
 ];
 
 // Use Open-Meteo /v1/forecast — auto best-match model per location
@@ -330,7 +347,7 @@ app.get("/api/scan/:stationId", async (req,res) => {
 });
 
 app.get("/api/scan-all", async (req,res) => {
-  const minEdge = parseFloat(req.query.minEdge)||1.5;
+  const minEdge = parseFloat(req.query.minEdge)||1.0;
   const results = [];
   for (const st of STATIONS) {
     try {
@@ -354,7 +371,7 @@ if (process.env.NODE_ENV==="production") {
 }
 
 // Auto-scan every 6 minutes
-cron.schedule("*/6 * * * *", async () => {
+cron.schedule("*/2 * * * *", async () => {
   console.log("[cron] Starting scheduled scan...");
   try {
     const results = [];
@@ -366,6 +383,44 @@ cron.schedule("*/6 * * * *", async () => {
     const opps = results.flatMap(r=>(r.opportunities||[]).length);
     console.log(`[cron] Done — ${opps} total edges found`);
   } catch(e) { console.error("[cron] Failed:", e.message); }
+});
+
+// ── Result cache — stores last scan per station ──────────────
+const scanCache = {};
+const lastScanTime = { ts: null };
+
+// Override scanStation to cache results
+const _originalScanStation = scanStation;
+async function scanStationCached(station, minEdge) {
+  const result = await _originalScanStation(station, minEdge);
+  scanCache[station.stationId] = result;
+  lastScanTime.ts = new Date().toISOString();
+  return result;
+}
+
+// Latest cached results — frontend polls this, no new API calls
+app.get("/api/latest", (req, res) => {
+  res.json({
+    stations:   Object.values(scanCache),
+    lastScan:   lastScanTime.ts,
+    count:      Object.keys(scanCache).length,
+    ts:         new Date().toISOString(),
+  });
+});
+
+// Override scan routes to use cached version
+app.get("/api/scan-cached/:stationId", async (req, res) => {
+  const cached = scanCache[req.params.stationId];
+  if (cached) return res.json(cached);
+  // Not cached yet — run fresh scan
+  const st = STATIONS.find(s => s.stationId===req.params.stationId);
+  if (!st) return res.status(404).json({error:"Not found"});
+  try {
+    const data = await scanStationCached(st, 1.0);
+    res.json(data);
+  } catch(e) {
+    res.status(502).json({error:e.message});
+  }
 });
 
 server.listen(PORT, () => {
