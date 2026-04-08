@@ -18,7 +18,6 @@ app.use("/api/", rateLimit({ windowMs: 60000, max: 300 }));
 
 const GAMMA   = "https://gamma-api.polymarket.com";
 const CLOB    = "https://clob.polymarket.com";
-const METEO   = "https://api.open-meteo.com/v1/forecast";
 const POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 const STATIONS = [
@@ -31,9 +30,11 @@ const STATIONS = [
 ];
 
 const MODELS = [
-  { id:"ecmwf", name:"ECMWF IFS", param:"best_match",   weight:0.45, heatBiasF:0.6,  precipBias:0.04 },
-  { id:"gfs",   name:"NOAA GFS",  param:"gfs_seamless",  weight:0.35, heatBiasF:1.8,  precipBias:0.12 },
-  { id:"icon",  name:"DWD ICON",  param:"icon_seamless", weight:0.20, heatBiasF:0.9,  precipBias:0.07 },
+  // endpoint: the correct Open-Meteo API URL for each model
+  // no 'models' param needed — each has its own endpoint
+  { id:"ecmwf", name:"ECMWF IFS", endpoint:"https://api.open-meteo.com/v1/forecast",  weight:0.45, heatBiasF:0.6,  precipBias:0.04 },
+  { id:"gfs",   name:"NOAA GFS",  endpoint:"https://api.open-meteo.com/v1/gfs",        weight:0.35, heatBiasF:1.8,  precipBias:0.12 },
+  { id:"icon",  name:"DWD ICON",  endpoint:"https://api.open-meteo.com/v1/dwd-icon",   weight:0.20, heatBiasF:0.9,  precipBias:0.07 },
 ];
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -91,9 +92,9 @@ async function getEnsemble(station) {
   const current = "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,precipitation,weather_code";
 
   const results = await Promise.allSettled(MODELS.map(async model => {
-    const url = `${METEO}?latitude=${station.lat}&longitude=${station.lon}`
+    const url = `${model.endpoint}?latitude=${station.lat}&longitude=${station.lon}`
       + `&timezone=${encodeURIComponent(station.tz)}&forecast_days=3`
-      + `&models=${model.param}&current=${current}&daily=${daily}`;
+      + `&current=${current}&daily=${daily}`;
     const { data } = await ext.get(url);
     return { model, data, probs: calcProbs(data, model, station) };
   }));
