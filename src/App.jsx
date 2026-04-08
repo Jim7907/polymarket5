@@ -182,6 +182,31 @@ function DiagPanel() {
   );
 }
 
+
+function MultiOppRow({o, color}) {
+  return (
+    <div style={{padding:"10px 14px",borderBottom:"1px solid #111",borderLeft:"3px solid "+(color||"#0ea5e9")}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:4}}>
+        <div style={{fontSize:10,color:"#94a3b8",flex:1,lineHeight:1.4,paddingRight:12}}>{o.question}</div>
+        <div style={{textAlign:"right",flexShrink:0}}>
+          <div style={{fontSize:12,fontWeight:800,color:o.netEdge>0?"#4ade80":"#f87171",fontFamily:"monospace"}}>
+            {o.direction}
+          </div>
+          <div style={{fontSize:10,color:color||"#0ea5e9",fontFamily:"monospace"}}>
+            +{Number(o.netEdge||0).toFixed(1)}% net
+          </div>
+        </div>
+      </div>
+      <div style={{fontSize:9,color:"#334155",lineHeight:1.7}}>
+        {o.note}
+        {o.fee===0&&<span style={{color:"#4ade80",marginLeft:6,fontWeight:700}}>★ 0% FEE</span>}
+        {o.daysLeft&&<span style={{marginLeft:6}}>{o.daysLeft}d left</span>}
+        {o.volume&&<span style={{marginLeft:6}}>Vol: ${Number(o.volume).toLocaleString()}</span>}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [status,setStatus]    = useState(STATUS.IDLE);
   const [stations,setStns]    = useState([]);
@@ -189,6 +214,7 @@ export default function App() {
   const [scanData,setScanData]= useState({});
   const [loadingIds,setLdg]   = useState(new Set());
   const [opps,setOpps]        = useState([]);
+  const [multiOpps,setMultiOpps] = useState([]);
   const [log,setLog]          = useState([]);
   const [stats,setStats]      = useState({edges:0,scanned:0,uptime:0,lastScan:null});
   const [tab,setTab]          = useState("live");
@@ -230,6 +256,11 @@ export default function App() {
           });
         }
         if (d.lastScan) setStats(s=>({...s,lastScan:d.lastScan.slice(11,19),scanned:d.count}));
+        // Multi-strategy opportunities from server
+        if (d.multiOpps && d.multiOpps.length > 0) {
+          setMultiOpps(d.multiOpps);
+          setStats(s=>({...s,edges:s.edges + d.multiOpps.length}));
+        }
       } catch(e) {}
     };
     pollLatest();
@@ -322,7 +353,7 @@ export default function App() {
       <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
         <Stat label="STATIONS"    value={stations.length}      color="#38bdf8"/>
         <Stat label="SCANNED"     value={stats.scanned}        color="#38bdf8"/>
-        <Stat label="EDGES FOUND" value={stats.edges}          color="#4ade80"/>
+        <Stat label="EDGES FOUND" value={stats.edges + multiOpps.length}          color="#4ade80"/>
         <Stat label="UPTIME"      value={fUp(stats.uptime)}    color="#94a3b8" sub="mm:ss"/>
         <Stat label="LAST SCAN"   value={stats.lastScan||"--"} color="#334155"/>
       </div>
@@ -363,8 +394,73 @@ export default function App() {
           )}
 
           {tab==="opps"&&(
-            <div style={{maxHeight:460,overflowY:"auto"}}>
-              {opps.length===0?<div style={{padding:40,textAlign:"center",color:"#1a1a2a",fontSize:12}}>No opportunities yet — click START LIVE</div>:opps.map((o,i)=><OppRow key={i} o={o}/>)}
+            <div style={{maxHeight:520,overflowY:"auto"}}>
+
+              {/* Geopolitics — 0% fee, highest priority */}
+              {multiOpps.filter(o=>o.type==="geopolitics").length>0&&(
+                <div>
+                  <div style={{padding:"6px 14px",background:"#0a2010",fontSize:9,color:"#4ade80",letterSpacing:2,fontWeight:700,borderBottom:"1px solid #0a2a10"}}>
+                    GEOPOLITICS — 0% FEE ({multiOpps.filter(o=>o.type==="geopolitics").length})
+                  </div>
+                  {multiOpps.filter(o=>o.type==="geopolitics").map((o,i)=>(
+                    <MultiOppRow key={i} o={o} color="#4ade80"/>
+                  ))}
+                </div>
+              )}
+
+              {/* NegRisk — guaranteed profit */}
+              {multiOpps.filter(o=>o.type==="negrisk").length>0&&(
+                <div>
+                  <div style={{padding:"6px 14px",background:"#0a1628",fontSize:9,color:"#0ea5e9",letterSpacing:2,fontWeight:700,borderBottom:"1px solid #0a1a28"}}>
+                    NEGRISK REBALANCING ({multiOpps.filter(o=>o.type==="negrisk").length})
+                  </div>
+                  {multiOpps.filter(o=>o.type==="negrisk").map((o,i)=>(
+                    <MultiOppRow key={i} o={o} color="#0ea5e9"/>
+                  ))}
+                </div>
+              )}
+
+              {/* Economics */}
+              {multiOpps.filter(o=>o.type==="economics").length>0&&(
+                <div>
+                  <div style={{padding:"6px 14px",background:"#1a1200",fontSize:9,color:"#facc15",letterSpacing:2,fontWeight:700,borderBottom:"1px solid #1a1200"}}>
+                    ECONOMICS / MACRO ({multiOpps.filter(o=>o.type==="economics").length})
+                  </div>
+                  {multiOpps.filter(o=>o.type==="economics").map((o,i)=>(
+                    <MultiOppRow key={i} o={o} color="#facc15"/>
+                  ))}
+                </div>
+              )}
+
+              {/* Crypto lag */}
+              {multiOpps.filter(o=>o.type==="crypto").length>0&&(
+                <div>
+                  <div style={{padding:"6px 14px",background:"#160a28",fontSize:9,color:"#a78bfa",letterSpacing:2,fontWeight:700,borderBottom:"1px solid #160a28"}}>
+                    CRYPTO PRICE LAG ({multiOpps.filter(o=>o.type==="crypto").length})
+                  </div>
+                  {multiOpps.filter(o=>o.type==="crypto").map((o,i)=>(
+                    <MultiOppRow key={i} o={o} color="#a78bfa"/>
+                  ))}
+                </div>
+              )}
+
+              {/* Weather */}
+              {opps.length>0&&(
+                <div>
+                  <div style={{padding:"6px 14px",background:"#0a0a14",fontSize:9,color:"#38bdf8",letterSpacing:2,fontWeight:700,borderBottom:"1px solid #111"}}>
+                    WEATHER EDGES ({opps.length})
+                  </div>
+                  {opps.map((o,i)=><OppRow key={i} o={o}/>)}
+                </div>
+              )}
+
+              {opps.length===0&&multiOpps.length===0&&(
+                <div style={{padding:40,textAlign:"center",color:"#1a1a2a",fontSize:12,lineHeight:2}}>
+                  <div>No opportunities yet</div>
+                  <div style={{fontSize:10,color:"#334155"}}>Server scans every 2 minutes automatically</div>
+                  <div style={{fontSize:10,color:"#334155"}}>Click START LIVE or wait for next cron cycle</div>
+                </div>
+              )}
             </div>
           )}
 
