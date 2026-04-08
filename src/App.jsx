@@ -121,6 +121,67 @@ function StationDetail({ data, loading, onRefresh }) {
   );
 }
 
+
+// ─── DIAGNOSTICS PANEL ───────────────────────────────────────
+function DiagPanel() {
+  const [result, setResult] = React.useState(null);
+  const [loading, setLoading] = React.useState(false);
+
+  const runTest = async () => {
+    setLoading(true);
+    setResult(null);
+    try {
+      const r = await fetch("/api/test");
+      const d = await r.json();
+      setResult(d);
+    } catch(e) {
+      setResult({ error: e.message, allOk: false });
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{padding:"12px 14px",background:"#0a0010",border:"1px solid #7c3aed",borderRadius:8,marginBottom:14}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+        <div style={{fontSize:10,color:"#a78bfa",fontWeight:700,letterSpacing:1}}>CONNECTIVITY DIAGNOSTICS</div>
+        <button onClick={runTest} disabled={loading} style={{background:"#7c3aed",color:"#fff",border:"none",borderRadius:5,padding:"4px 12px",cursor:"pointer",fontSize:9,fontFamily:"monospace"}}>
+          {loading ? "TESTING..." : "RUN TEST"}
+        </button>
+      </div>
+      {!result && !loading && (
+        <div style={{fontSize:9,color:"#334155"}}>Click RUN TEST to check if the server can reach Open-Meteo and Polymarket APIs</div>
+      )}
+      {loading && (
+        <div style={{fontSize:9,color:"#a78bfa"}}>Testing connectivity to all APIs...</div>
+      )}
+      {result && (
+        <div>
+          {result.error && (
+            <div style={{fontSize:9,color:"#f87171",marginBottom:6}}>Error: {result.error}</div>
+          )}
+          {result.results && Object.entries(result.results).map(([name, r]) => (
+            <div key={name} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid #111",fontSize:9}}>
+              <span style={{color:"#64748b",fontFamily:"monospace"}}>{name}</span>
+              <span style={{color:r.ok?"#4ade80":"#f87171",fontFamily:"monospace",fontWeight:700}}>
+                {r.ok ? "OK " + r.status : "FAIL: " + (r.code||r.error||r.status)}
+              </span>
+            </div>
+          ))}
+          {result.allOk === false && !result.error && (
+            <div style={{fontSize:9,color:"#facc15",marginTop:6,lineHeight:1.7}}>
+              Some APIs are blocked. Check Hostinger firewall — allow outbound HTTPS (port 443).
+              The bot needs to reach: api.open-meteo.com and gamma-api.polymarket.com
+            </div>
+          )}
+          {result.allOk === true && (
+            <div style={{fontSize:9,color:"#4ade80",marginTop:6}}>All APIs reachable. If scan still fails, check the LOG tab for details.</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [status,setStatus]    = useState(STATUS.IDLE);
   const [stations,setStns]    = useState([]);
@@ -143,6 +204,37 @@ export default function App() {
   useEffect(()=>{
     fetch("/api/stations").then(r=>r.json()).then(d=>{setStns(d);addLog(`Loaded ${d.length} stations`,"success");}).catch(e=>addLog("Stations: "+e.message,"error"));
     fetch("/api/health").then(r=>r.json()).then(h=>{setHealth(h);addLog("Server OK | uptime "+Math.floor(h.uptime)+"s","success");}).catch(e=>addLog("Health: "+e.message,"error"));
+
+    // Poll server for cached results every 30s
+    // Server cron runs every 2min regardless of browser tab state
+    const pollLatest = async () => {
+      try {
+        const r = await fetch("/api/latest");
+        const d = await r.json();
+        if (!d.stations || d.stations.length === 0) return;
+        d.stations.forEach(st => {
+          if (st.station) setScanData(p=>({...p,[st.station.stationId]:st}));
+        });
+        const allOpps = d.stations.flatMap(st=>
+          (st.opportunities||[]).map(o=>({...o,city:st.station?.city,stationId:st.station?.stationId,ts:o.ts||new Date().toISOString().slice(11,19)}))
+        );
+        if (allOpps.length > 0) {
+          setOpps(p=>{
+            const seen = new Set(p.map(x=>x.marketId+x.stationId));
+            const fresh = allOpps.filter(o=>!seen.has(o.marketId+o.stationId));
+            if (fresh.length > 0) {
+              setStats(s=>({...s,edges:s.edges+fresh.length}));
+              fresh.forEach(o=>addLog(`EDGE [${o.stationId}] ${o.outcome} ${o.direction} net=${Number(o.netEdge).toFixed(1)}%`,"success"));
+            }
+            return [...fresh,...p].slice(0,50);
+          });
+        }
+        if (d.lastScan) setStats(s=>({...s,lastScan:d.lastScan.slice(11,19),scanned:d.count}));
+      } catch(e) {}
+    };
+    pollLatest();
+    const pid = setInterval(pollLatest, 30000);
+    return ()=>clearInterval(pid);
   },[addLog]);
 
   useEffect(()=>{
@@ -308,6 +400,7 @@ export default function App() {
                 <div>WS Clients: {health.wsClients}</div>
                 <div>Polymarket WS: {health.polyWsConnected?"Connected":"Disconnected"}</div>
               </div>}
+              <DiagPanel />
               <div style={{padding:"12px 14px",background:"#080f1e",border:"1px solid #0ea5e9",borderRadius:8,fontSize:9,color:"#4a5568",lineHeight:1.9}}>
                 <div style={{color:"#0ea5e9",fontWeight:700,marginBottom:6}}>DATA SOURCES</div>
                 <div>Weather: Open-Meteo ECMWF+GFS+ICON (exact station coords)</div>
