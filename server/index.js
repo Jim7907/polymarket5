@@ -14,7 +14,7 @@ const PORT   = process.env.PORT || 3001;
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
-app.use("/api/", rateLimit({ windowMs: 60000, max: 200 }));
+app.use("/api/", rateLimit({ windowMs: 60000, max: 300 }));
 
 const GAMMA   = "https://gamma-api.polymarket.com";
 const CLOB    = "https://clob.polymarket.com";
@@ -40,11 +40,16 @@ const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const CtoF  = (c) => +(c * 9/5 + 32).toFixed(1);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Axios instance with longer timeout and better error handling
-const http_client = axios.create({
-  timeout: 15000,
-  headers: { "Accept": "application/json", "User-Agent": "polymarket-bot/1.0" }
+// Single axios instance — all external calls go through here
+const ext = axios.create({
+  timeout: 20000,
+  headers: {
+    "Accept":     "application/json",
+    "User-Agent": "Mozilla/5.0 (compatible; polymarket-bot/1.0)",
+  },
 });
+
+// ── Core logic functions (no HTTP round-trips) ────────────────
 
 function calcProbs(data, model, station) {
   const d = data.daily, cur = data.current;
@@ -80,6 +85,124 @@ function buildEnsemble(results) {
   return { ens, spread };
 }
 
+// Fetch ensemble weather — pure function, no HTTP round-trips
+async function getEnsemble(station) {
+  const daily   = "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,snowfall_sum,weather_code_dominant,wind_speed_10m_max";
+  const current = "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,precipitation,weather_code";
+
+  const results = await Promise.allSettled(MODELS.map(async model => {
+    const url = `${METEO}?latitude=${station.lat}&longitude=${station.lon}`
+      + `&timezone=${encodeURIComponent(station.tz)}&forecast_days=3`
+      + `&models=${model.param}&current=${current}&daily=${daily}`;
+    const { data } = await ext.get(url);
+    return { model, data, probs: calcProbs(data, model, station) };
+  }));
+
+  const ok     = results.filter(r => r.status==="fulfilled").map(r => r.value);
+  const failed = results.filter(r => r.status==="rejected").map((r,i) => ({
+    model: MODELS[i].id,
+    error: r.reason?.message,
+    code:  r.reason?.code,
+  }));
+
+  if (!ok.length) throw new Error(`All weather models failed: ${JSON.stringify(failed)}`);
+
+  const { ens, spread } = buildEnsemble(ok);
+  return { ensemble:ens, spread, modelsOk:ok.length, failed, currentConditions:ok[0].probs, perModel:ok.map(r=>({modelId:r.model.id,name:r.model.name,probs:r.probs})) };
+}
+
+// Fetch live Polymarket markets — pure function
+async function getMarkets() {
+  try {
+    const { data } = await ext.get(`${GAMMA}/markets?tag_slug=weather&active=true&limit=100&closed=false`);
+    return Array.isArray(data) ? data : (data.data || data.markets || []);
+  } catch(e) {
+    console.warn("[markets] Failed:", e.message);
+    return [];
+  }
+}
+
+// Fetch live price — pure function
+async function getPrice(tokenId) {
+  try {
+    const { data } = await ext.get(`${CLOB}/price?token_id=${tokenId}&side=BUY`);
+    return parseFloat(data.price);
+  } catch(e) {
+    return null;
+  }
+}
+
+// Full scan for one station — pure function
+async function scanStation(station, minEdge) {
+  // 1. Get weather ensemble
+  const ensData = await getEnsemble(station);
+
+  // 2. Get live markets
+  const allMarkets = await getMarkets();
+  const city = station.city.toLowerCase();
+  const markets = allMarkets.filter(m => {
+    const q = (m.question||m.title||"").toLowerCase();
+    return q.includes(city) || q.includes(station.stationId.toLowerCase());
+  }).slice(0, 8);
+
+  // 3. Fetch live prices
+  const priceMap = {};
+  await Promise.all(markets.map(async m => {
+    const tid = m.clobTokenIds?.[0] || m.tokens?.[0]?.token_id;
+    if (tid) {
+      const price = await getPrice(tid);
+      if (price != null) priceMap[m.conditionId || m.id] = price;
+    }
+  }));
+
+  // 4. Compute opportunities
+  const OKEYS = [
+    { key:"hot",   label:"HOT (>90F/32C)", fee:0.0125 },
+    { key:"rain",  label:"RAIN (>0.5in)",  fee:0.0125 },
+    { key:"snow",  label:"SNOW",           fee:0.0125 },
+    { key:"storm", label:"STORM",          fee:0.0125 },
+  ];
+
+  const opportunities = [];
+  OKEYS.forEach(o => {
+    const prob = ensData.ensemble[o.key];
+    const sp   = ensData.spread[o.key];
+    const mkt  = markets.find(m => {
+      const q = (m.question||"").toLowerCase();
+      return (o.key==="hot"&&q.includes("temperature"))
+          || (o.key==="rain"&&q.includes("rain"))
+          || (o.key==="snow"&&q.includes("snow"))
+          || (o.key==="storm"&&q.includes("thunder"));
+    });
+    const mktId    = mkt ? (mkt.conditionId||mkt.id) : null;
+    const polyProb = mktId ? priceMap[mktId] : null;
+    if (polyProb == null) return;
+    const raw = (prob - polyProb) * 100;
+    const net = raw - o.fee * 100;
+    if (Math.abs(net) > minEdge && sp < 15) {
+      opportunities.push({
+        outcome: o.label, key: o.key,
+        modelProb: +prob.toFixed(3), polyProb: +polyProb.toFixed(3),
+        rawEdge: +raw.toFixed(2), netEdge: +net.toFixed(2),
+        spread: sp, direction: net > 0 ? "BUY YES" : "BUY NO",
+        marketId: mktId, question: mkt?.question, isLive: true,
+      });
+    }
+  });
+
+  return {
+    station,
+    ensemble:   ensData.ensemble,
+    spread:     ensData.spread,
+    modelsOk:   ensData.modelsOk,
+    conditions: ensData.currentConditions,
+    markets,
+    liveMarkets: markets.length,
+    opportunities,
+    fetchTime: new Date().toISOString(),
+  };
+}
+
 // ── WebSocket relay ───────────────────────────────────────────
 const wss = new WebSocketServer({ server });
 const clients = new Set();
@@ -89,10 +212,10 @@ let polyWs = null;
 function connectPolyWS() {
   try {
     polyWs = new WebSocket(POLY_WS);
-    polyWs.on("open",  () => { console.log("[WS] Polymarket connected"); if(subIds.size>0) polyWs.send(JSON.stringify({type:"subscribe",market_ids:[...subIds]})); });
-    polyWs.on("message",(d) => clients.forEach(c => { if(c.readyState===WebSocket.OPEN) c.send(d.toString()); }));
-    polyWs.on("close", () => { console.log("[WS] Reconnecting in 5s..."); setTimeout(connectPolyWS,5000); });
-    polyWs.on("error", (e) => console.error("[WS]",e.message));
+    polyWs.on("open",    () => { console.log("[WS] Polymarket connected"); if(subIds.size>0) polyWs.send(JSON.stringify({type:"subscribe",market_ids:[...subIds]})); });
+    polyWs.on("message", (d) => clients.forEach(c => { if(c.readyState===WebSocket.OPEN) c.send(d.toString()); }));
+    polyWs.on("close",   () => { console.log("[WS] Reconnecting..."); setTimeout(connectPolyWS,5000); });
+    polyWs.on("error",   (e) => console.error("[WS]",e.message));
   } catch(e) { setTimeout(connectPolyWS, 10000); }
 }
 
@@ -110,35 +233,35 @@ wss.on("connection", ws => {
   });
 });
 
-// ── Routes ───────────────────────────────────────────────────
+// ── HTTP Routes ───────────────────────────────────────────────
 
-// Health
 app.get("/api/health", (req,res) => res.json({
-  status:"ok", uptime:process.uptime(),
-  wsClients:clients.size,
-  polyWsConnected:polyWs?.readyState===WebSocket.OPEN,
-  ts:new Date().toISOString()
+  status: "ok",
+  uptime: process.uptime(),
+  wsClients: clients.size,
+  polyWsConnected: polyWs?.readyState === WebSocket.OPEN,
+  ts: new Date().toISOString(),
 }));
 
-// Connectivity test - diagnoses which external APIs are reachable
+// Connectivity test — tests each external API directly
 app.get("/api/test", async (req,res) => {
-  const results = {};
   const tests = [
     { name:"open-meteo", url:"https://api.open-meteo.com/v1/forecast?latitude=40.77&longitude=-73.87&current=temperature_2m&timezone=auto&forecast_days=1" },
     { name:"gamma-api",  url:"https://gamma-api.polymarket.com/markets?limit=1&active=true" },
     { name:"clob-api",   url:"https://clob.polymarket.com/markets?limit=1" },
-    { name:"dns-check",  url:"https://1.1.1.1" },
   ];
+  const results = {};
   for (const t of tests) {
     try {
-      const r = await http_client.get(t.url, { timeout: 8000 });
-      results[t.name] = { ok:true, status:r.status };
+      const r = await ext.get(t.url, { timeout: 8000 });
+      results[t.name] = { ok:true, status:r.status, ms: Date.now() };
     } catch(e) {
       results[t.name] = { ok:false, error:e.message, code:e.code, status:e.response?.status };
     }
   }
   const allOk = Object.values(results).every(r => r.ok);
-  res.status(allOk ? 200 : 502).json({ allOk, results, ts:new Date().toISOString() });
+  console.log("[test]", JSON.stringify(results));
+  res.status(allOk?200:502).json({ allOk, results, ts:new Date().toISOString() });
 });
 
 app.get("/api/stations", (req,res) => res.json(STATIONS));
@@ -147,99 +270,79 @@ app.get("/api/ensemble/:stationId", async (req,res) => {
   const st = STATIONS.find(s => s.stationId===req.params.stationId);
   if(!st) return res.status(404).json({error:"Station not found"});
   try {
-    const daily   = "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,snowfall_sum,weather_code_dominant,wind_speed_10m_max";
-    const current = "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,precipitation,weather_code";
-    const results = await Promise.allSettled(MODELS.map(async m => {
-      const url = `${METEO}?latitude=${st.lat}&longitude=${st.lon}&timezone=${encodeURIComponent(st.tz)}&forecast_days=3&models=${m.param}&current=${current}&daily=${daily}`;
-      const { data } = await http_client.get(url);
-      return { model:m, data, probs:calcProbs(data,m,st) };
-    }));
-    const ok     = results.filter(r=>r.status==="fulfilled").map(r=>r.value);
-    const failed = results.filter(r=>r.status==="rejected").map((r,i)=>({ model:MODELS[i].id, error:r.reason?.message, code:r.reason?.code }));
-    if(!ok.length) return res.status(502).json({ error:"All weather models failed", failed, hint:"Check /api/test for connectivity" });
-    const {ens,spread} = buildEnsemble(ok);
-    res.json({ station:st, ensemble:ens, spread, modelsOk:ok.length, failed, currentConditions:ok[0].probs, perModel:ok.map(r=>({modelId:r.model.id,name:r.model.name,probs:r.probs})), fetchTime:new Date().toISOString() });
-  } catch(e) { res.status(500).json({ error:e.message, code:e.code }); }
+    const data = await getEnsemble(st);
+    res.json({ station:st, ...data, fetchTime:new Date().toISOString() });
+  } catch(e) {
+    console.error("[ensemble]", st.stationId, e.message);
+    res.status(502).json({ error:e.message, code:e.code, station:st });
+  }
 });
 
 app.get("/api/polymarket/markets", async (req,res) => {
-  try {
-    const { data } = await http_client.get(`${GAMMA}/markets?tag_slug=weather&active=true&limit=100&closed=false`);
-    const markets = Array.isArray(data)?data:(data.data||data.markets||[]);
-    res.json({ markets, count:markets.length, fetchTime:new Date().toISOString() });
-  } catch(e) { res.status(502).json({ error:e.message, code:e.code, markets:[] }); }
+  const markets = await getMarkets();
+  res.json({ markets, count:markets.length, fetchTime:new Date().toISOString() });
 });
 
 app.get("/api/polymarket/price/:tokenId", async (req,res) => {
-  try {
-    const { data } = await http_client.get(`${CLOB}/price?token_id=${req.params.tokenId}&side=BUY`);
-    res.json({ tokenId:req.params.tokenId, price:parseFloat(data.price), raw:data });
-  } catch(e) { res.status(502).json({ error:e.message, code:e.code }); }
+  const price = await getPrice(req.params.tokenId);
+  if (price == null) return res.status(502).json({error:"Price unavailable"});
+  res.json({ tokenId:req.params.tokenId, price });
 });
 
 app.get("/api/scan/:stationId", async (req,res) => {
-  const st = STATIONS.find(s=>s.stationId===req.params.stationId);
+  const st = STATIONS.find(s => s.stationId===req.params.stationId);
   if(!st) return res.status(404).json({error:"Station not found"});
-  const minEdge = parseFloat(req.query.minEdge)||1.5;
   try {
-    const base = `http://localhost:${PORT}`;
-    const [ensRes, mktRes] = await Promise.all([
-      http_client.get(`${base}/api/ensemble/${st.stationId}`),
-      http_client.get(`${base}/api/polymarket/markets`).catch(e=>({ data:{ markets:[], error:e.message } })),
-    ]);
-    const ens  = ensRes.data;
-    const city = st.city.toLowerCase();
-    const mkts = (mktRes.data.markets||[]).filter(m=>{
-      const q=(m.question||m.title||"").toLowerCase();
-      return q.includes(city)||q.includes(st.stationId.toLowerCase());
-    }).slice(0,8);
-
-    const priceMap = {};
-    await Promise.all(mkts.map(async m=>{
-      const tid=m.clobTokenIds?.[0]||m.tokens?.[0]?.token_id;
-      if(tid){try{const pr=await http_client.get(`${base}/api/polymarket/price/${tid}`);priceMap[m.conditionId||m.id]=pr.data.price;}catch(e){}}
-    }));
-
-    const OKEYS=[{key:"hot",label:"HOT (>90F/32C)",fee:0.0125},{key:"rain",label:"RAIN (>0.5in)",fee:0.0125},{key:"snow",label:"SNOW",fee:0.0125},{key:"storm",label:"STORM",fee:0.0125}];
-    const opportunities=[];
-    OKEYS.forEach(o=>{
-      const prob=ens.ensemble[o.key],sp=ens.spread[o.key];
-      const mkt=mkts.find(m=>{const q=(m.question||"").toLowerCase();return(o.key==="hot"&&q.includes("temperature"))||(o.key==="rain"&&q.includes("rain"))||(o.key==="snow"&&q.includes("snow"))||(o.key==="storm"&&q.includes("thunder"));});
-      const mktId=mkt?(mkt.conditionId||mkt.id):null;
-      const polyProb=mktId?priceMap[mktId]:null;
-      if(polyProb==null) return;
-      const raw=(prob-polyProb)*100,net=raw-o.fee*100;
-      if(Math.abs(net)>minEdge&&sp<15) opportunities.push({outcome:o.label,key:o.key,modelProb:+prob.toFixed(3),polyProb:+polyProb.toFixed(3),rawEdge:+raw.toFixed(2),netEdge:+net.toFixed(2),spread:sp,direction:net>0?"BUY YES":"BUY NO",marketId:mktId,question:mkt?.question,isLive:true});
-    });
-
-    res.json({station:st,ensemble:ens.ensemble,spread:ens.spread,modelsOk:ens.modelsOk,conditions:ens.currentConditions,markets:mkts,liveMarkets:mkts.length,opportunities,fetchTime:new Date().toISOString()});
-  } catch(e) { res.status(500).json({error:e.message, code:e.code}); }
+    const data = await scanStation(st, parseFloat(req.query.minEdge)||1.5);
+    res.json(data);
+  } catch(e) {
+    console.error("[scan]", st.stationId, e.message);
+    res.status(502).json({ error:e.message, code:e.code, station:st });
+  }
 });
 
 app.get("/api/scan-all", async (req,res) => {
-  const minEdge=parseFloat(req.query.minEdge)||1.5;
-  const results=[];
-  for(const st of STATIONS){
-    try{const r=await http_client.get(`http://localhost:${PORT}/api/scan/${st.stationId}?minEdge=${minEdge}`);results.push(r.data);}
-    catch(e){results.push({station:st,error:e.message,code:e.code,opportunities:[]});}
-    await sleep(400);
+  const minEdge = parseFloat(req.query.minEdge)||1.5;
+  const results = [];
+  for (const st of STATIONS) {
+    try {
+      const data = await scanStation(st, minEdge);
+      results.push(data);
+      console.log(`[scan] ${st.stationId} OK — ${data.modelsOk}/3 models, ${data.opportunities.length} edges`);
+    } catch(e) {
+      console.error(`[scan] ${st.stationId} FAILED:`, e.message);
+      results.push({ station:st, error:e.message, opportunities:[] });
+    }
+    await sleep(300);
   }
-  const opps=results.flatMap(r=>(r.opportunities||[]).map(o=>({...o,city:r.station?.city,stationId:r.station?.stationId})));
-  res.json({results,opportunities:opps,total:opps.length,fetchTime:new Date().toISOString()});
+  const opps = results.flatMap(r => (r.opportunities||[]).map(o=>({...o,city:r.station?.city,stationId:r.station?.stationId})));
+  res.json({ results, opportunities:opps, total:opps.length, fetchTime:new Date().toISOString() });
 });
 
-if(process.env.NODE_ENV==="production"){
+// Serve React in production
+if (process.env.NODE_ENV==="production") {
   app.use(express.static(path.join(__dirname,"../build")));
-  app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"../build/index.html")));
+  app.get("*",(req,res) => res.sendFile(path.join(__dirname,"../build/index.html")));
 }
 
-cron.schedule("*/6 * * * *",async()=>{
-  try{await http_client.get(`http://localhost:${PORT}/api/scan-all`,{timeout:120000});}
-  catch(e){console.error("[CRON]",e.message);}
+// Auto-scan every 6 minutes
+cron.schedule("*/6 * * * *", async () => {
+  console.log("[cron] Starting scheduled scan...");
+  try {
+    const results = [];
+    for (const st of STATIONS) {
+      try { results.push(await scanStation(st, 1.5)); }
+      catch(e) { console.error(`[cron] ${st.stationId}:`, e.message); }
+      await sleep(300);
+    }
+    const opps = results.flatMap(r=>(r.opportunities||[]).length);
+    console.log(`[cron] Done — ${opps} total edges found`);
+  } catch(e) { console.error("[cron] Failed:", e.message); }
 });
 
-server.listen(PORT,()=>{
-  console.log(`\n Polymarket Weather Bot on http://localhost:${PORT}`);
-  console.log(` Test connectivity: http://localhost:${PORT}/api/test\n`);
+server.listen(PORT, () => {
+  console.log(`\n Polymarket Weather Bot`);
+  console.log(` http://localhost:${PORT}`);
+  console.log(` Connectivity test: http://localhost:${PORT}/api/test\n`);
   connectPolyWS();
 });
