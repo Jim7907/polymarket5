@@ -29,13 +29,9 @@ const STATIONS = [
   { city:"Hong Kong",   country:"HK", stationId:"VHHH", stationName:"HK Intl Airport",     lat:22.3089,  lon:113.9149,  tz:"Asia/Hong_Kong",      unit:"C" },
 ];
 
-const MODELS = [
-  // endpoint: the correct Open-Meteo API URL for each model
-  // no 'models' param needed — each has its own endpoint
-  { id:"ecmwf", name:"ECMWF IFS", endpoint:"https://api.open-meteo.com/v1/forecast",  weight:0.45, heatBiasF:0.6,  precipBias:0.04 },
-  { id:"gfs",   name:"NOAA GFS",  endpoint:"https://api.open-meteo.com/v1/gfs",        weight:0.35, heatBiasF:1.8,  precipBias:0.12 },
-  { id:"icon",  name:"DWD ICON",  endpoint:"https://api.open-meteo.com/v1/dwd-icon",   weight:0.20, heatBiasF:0.9,  precipBias:0.07 },
-];
+// Use Open-Meteo /v1/forecast — auto best-match model per location
+// No models param needed — avoids 400 errors from invalid model names
+const FORECAST_URL = "https://api.open-meteo.com/v1/forecast";
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const CtoF  = (c) => +(c * 9/5 + 32).toFixed(1);
@@ -52,7 +48,8 @@ const ext = axios.create({
 
 // ── Core logic functions (no HTTP round-trips) ────────────────
 
-function calcProbs(data, model, station) {
+function calcSingleProbs(data, station) {
+  const model = { heatBiasF: 0.0, precipBias: 0.0 }; // best_match needs no bias correction
   const d = data.daily, cur = data.current;
   let maxC = (d.temperature_2m_max[0] || 0) - (model.heatBiasF * 5/9);
   const maxF   = CtoF(maxC);
@@ -61,7 +58,7 @@ function calcProbs(data, model, station) {
   const pPct   = clamp((d.precipitation_probability_max[0] || 0) / 100 * (1 - model.precipBias * 0.5), 0, 1);
   const snowMm = d.snowfall_sum[0] || 0;
   const wind   = d.wind_speed_10m_max[0] || 0;
-  const wmo    = d.weather_code_dominant[0] || 0;
+  const wmo    = cur.weather_code || 0; // use current weather_code instead
   const hum    = cur.relative_humidity_2m || 0;
   const precIn = precMm * 0.03937;
   const hot = station.unit === "F"
@@ -86,30 +83,26 @@ function buildEnsemble(results) {
   return { ens, spread };
 }
 
-// Fetch ensemble weather — pure function, no HTTP round-trips
+// Fetch weather — single reliable call, Open-Meteo auto-selects best model
 async function getEnsemble(station) {
-  const daily   = "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,snowfall_sum,weather_code_dominant,wind_speed_10m_max";
+  const daily   = "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,snowfall_sum,wind_speed_10m_max";
   const current = "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,precipitation,weather_code";
 
-  const results = await Promise.allSettled(MODELS.map(async model => {
-    const url = `${model.endpoint}?latitude=${station.lat}&longitude=${station.lon}`
-      + `&timezone=${encodeURIComponent(station.tz)}&forecast_days=3`
-      + `&current=${current}&daily=${daily}`;
-    const { data } = await ext.get(url);
-    return { model, data, probs: calcProbs(data, model, station) };
-  }));
+  const url = `${FORECAST_URL}?latitude=${station.lat}&longitude=${station.lon}`
+    + `&timezone=${encodeURIComponent(station.tz)}&forecast_days=3`
+    + `&current=${current}&daily=${daily}`;
 
-  const ok     = results.filter(r => r.status==="fulfilled").map(r => r.value);
-  const failed = results.filter(r => r.status==="rejected").map((r,i) => ({
-    model: MODELS[i].id,
-    error: r.reason?.message,
-    code:  r.reason?.code,
-  }));
+  const { data } = await ext.get(url);
+  const probs = calcSingleProbs(data, station);
 
-  if (!ok.length) throw new Error(`All weather models failed: ${JSON.stringify(failed)}`);
-
-  const { ens, spread } = buildEnsemble(ok);
-  return { ensemble:ens, spread, modelsOk:ok.length, failed, currentConditions:ok[0].probs, perModel:ok.map(r=>({modelId:r.model.id,name:r.model.name,probs:r.probs})) };
+  return {
+    ensemble:          probs,
+    spread:            { hot:0, rain:0, snow:0, storm:0 },
+    modelsOk:          1,
+    failed:            [],
+    currentConditions: probs,
+    perModel:          [{ modelId:"best_match", name:"Open-Meteo Best Match", probs }],
+  };
 }
 
 // Fetch live Polymarket markets — pure function
