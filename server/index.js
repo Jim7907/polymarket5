@@ -125,22 +125,56 @@ async function getEnsemble(station) {
 // Weather keywords that must appear in the market question
 const WEATHER_KEYWORDS = ["temperature", "rain", "rainfall", "precipitation",
   "snow", "snowfall", "thunder", "storm", "humid", "wind", "weather", "forecast",
-  "high temp", "low temp", "degrees", "celsius", "fahrenheit"];
+  "high temp", "low temp", "degrees", "celsius", "fahrenheit", "inches", "heat",
+  "cold", "warm", "hot", "fog", "hail", "lightning", "freeze"];
 
-// Fetch live Polymarket weather markets only
+// Fetch live Polymarket weather markets
+// Tries multiple API patterns since tag_slug reliability varies
 async function getMarkets() {
+  let allMarkets = [];
+
+  // Strategy 1: tag_slug=weather (original)
   try {
     const { data } = await ext.get(`${GAMMA}/markets?tag_slug=weather&active=true&limit=200&closed=false`);
-    const all = Array.isArray(data) ? data : (data.data || data.markets || []);
-    // Filter to only actual weather markets by checking question content
-    return all.filter(m => {
-      const q = (m.question || m.title || "").toLowerCase();
-      return WEATHER_KEYWORDS.some(kw => q.includes(kw));
-    });
-  } catch(e) {
-    console.warn("[markets] Failed:", e.message);
-    return [];
-  }
+    const m = Array.isArray(data) ? data : (data.data || data.markets || []);
+    allMarkets.push(...m);
+    console.log(`[markets] tag_slug=weather: ${m.length} results`);
+  } catch(e) { console.warn("[markets] tag_slug failed:", e.message); }
+
+  // Strategy 2: events endpoint with weather tag
+  try {
+    const { data } = await ext.get(`${GAMMA}/events?tag_slug=weather&active=true&limit=50&closed=false`);
+    const events = Array.isArray(data) ? data : (data.data || data.events || []);
+    const eventMarkets = events.flatMap(e => e.markets || []);
+    allMarkets.push(...eventMarkets);
+    console.log(`[markets] events tag_slug=weather: ${eventMarkets.length} results`);
+  } catch(e) { console.warn("[markets] events failed:", e.message); }
+
+  // Strategy 3: search by weather keywords directly
+  try {
+    const { data } = await ext.get(`${GAMMA}/markets?active=true&limit=200&closed=false&keyword=weather`);
+    const m = Array.isArray(data) ? data : (data.data || data.markets || []);
+    allMarkets.push(...m);
+    console.log(`[markets] keyword=weather: ${m.length} results`);
+  } catch(e) {}
+
+  // Deduplicate by conditionId
+  const seen = new Set();
+  const deduped = allMarkets.filter(m => {
+    const key = m.conditionId || m.id;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Filter to only actual weather content
+  const weatherOnly = deduped.filter(m => {
+    const q = (m.question || m.title || "").toLowerCase();
+    return WEATHER_KEYWORDS.some(kw => q.includes(kw));
+  });
+
+  console.log(`[markets] Total weather markets after dedup+filter: ${weatherOnly.length}`);
+  return weatherOnly;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -464,10 +498,21 @@ async function scanStation(station, minEdge) {
   // 2. Get live markets
   const allMarkets = await getMarkets();
   const city = station.city.toLowerCase();
+  // Build multiple search terms for each city
+  const cityAliases = {
+    "new york":    ["new york", "nyc", "jfk", "laguardia", "klga"],
+    "los angeles": ["los angeles", "l.a.", "lax", "klax"],
+    "hong kong":   ["hong kong", "hk", "vhhh"],
+    "chicago":     ["chicago", "kord", "o'hare", "ohare"],
+  };
+  const aliases = cityAliases[city] || [city, station.stationId.toLowerCase()];
+
   const markets = allMarkets.filter(m => {
     const q = (m.question||m.title||"").toLowerCase();
-    return q.includes(city) || q.includes(station.stationId.toLowerCase());
+    return aliases.some(a => q.includes(a));
   }).slice(0, 8);
+
+  console.log(`[scan] ${station.stationId}: ${allMarkets.length} total weather markets, ${markets.length} matched for ${station.city}`);
 
   // 3. Fetch live prices — try CLOB then fall back to Gamma outcomePrices
   const priceMap = {};
@@ -981,6 +1026,29 @@ app.get("/api/scan-all", async (req,res) => {
   }
   const opps = results.flatMap(r => (r.opportunities||[]).map(o=>({...o,city:r.station?.city,stationId:r.station?.stationId})));
   res.json({ results, opportunities:opps, total:opps.length, fetchTime:new Date().toISOString() });
+});
+
+// Debug: show raw market fetch results — use this to diagnose 0 markets
+app.get("/api/debug-markets", async (req, res) => {
+  const results = {};
+  try {
+    const r1 = await ext.get(`${GAMMA}/markets?tag_slug=weather&active=true&limit=5&closed=false`);
+    results.tagSlugWeather = { count: (Array.isArray(r1.data)?r1.data:r1.data?.markets||[]).length, sample: (Array.isArray(r1.data)?r1.data:r1.data?.markets||[]).slice(0,2).map(m=>m.question) };
+  } catch(e) { results.tagSlugWeather = { error: e.message }; }
+  try {
+    const r2 = await ext.get(`${GAMMA}/events?tag_slug=weather&active=true&limit=5&closed=false`);
+    const evs = Array.isArray(r2.data)?r2.data:r2.data?.events||[];
+    results.eventsWeather = { count: evs.length, markets: evs.flatMap(e=>e.markets||[]).length, sample: evs.slice(0,2).map(e=>e.title||e.slug) };
+  } catch(e) { results.eventsWeather = { error: e.message }; }
+  try {
+    const r3 = await ext.get(`${GAMMA}/markets?active=true&limit=5&closed=false&keyword=rain`);
+    results.keywordRain = { count: (Array.isArray(r3.data)?r3.data:r3.data?.markets||[]).length, sample: (Array.isArray(r3.data)?r3.data:r3.data?.markets||[]).slice(0,2).map(m=>m.question) };
+  } catch(e) { results.keywordRain = { error: e.message }; }
+  try {
+    const r4 = await ext.get(`${GAMMA}/markets?active=true&limit=5&closed=false&search=temperature`);
+    results.searchTemp = { count: (Array.isArray(r4.data)?r4.data:r4.data?.markets||[]).length };
+  } catch(e) { results.searchTemp = { error: e.message }; }
+  res.json({ results, ts: new Date().toISOString() });
 });
 
 // Multi-strategy scan endpoint
