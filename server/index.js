@@ -105,25 +105,57 @@ async function getEnsemble(station) {
   };
 }
 
-// Fetch live Polymarket markets — pure function
+// Weather keywords that must appear in the market question
+const WEATHER_KEYWORDS = ["temperature", "rain", "rainfall", "precipitation",
+  "snow", "snowfall", "thunder", "storm", "humid", "wind", "weather", "forecast",
+  "high temp", "low temp", "degrees", "celsius", "fahrenheit"];
+
+// Fetch live Polymarket weather markets only
 async function getMarkets() {
   try {
-    const { data } = await ext.get(`${GAMMA}/markets?tag_slug=weather&active=true&limit=100&closed=false`);
-    return Array.isArray(data) ? data : (data.data || data.markets || []);
+    const { data } = await ext.get(`${GAMMA}/markets?tag_slug=weather&active=true&limit=200&closed=false`);
+    const all = Array.isArray(data) ? data : (data.data || data.markets || []);
+    // Filter to only actual weather markets by checking question content
+    return all.filter(m => {
+      const q = (m.question || m.title || "").toLowerCase();
+      return WEATHER_KEYWORDS.some(kw => q.includes(kw));
+    });
   } catch(e) {
     console.warn("[markets] Failed:", e.message);
     return [];
   }
 }
 
-// Fetch live price — pure function
+// Fetch live YES price from CLOB
 async function getPrice(tokenId) {
   try {
     const { data } = await ext.get(`${CLOB}/price?token_id=${tokenId}&side=BUY`);
-    return parseFloat(data.price);
+    const p = parseFloat(data.price);
+    return isNaN(p) ? null : p;
   } catch(e) {
     return null;
   }
+}
+
+// Get price — try CLOB first, fall back to Gamma outcomePrices
+async function getPriceWithFallback(market) {
+  // Try CLOB token ID
+  const tokenId = market.clobTokenIds?.[0] || market.tokens?.[0]?.token_id;
+  if (tokenId) {
+    const clobPrice = await getPrice(tokenId);
+    if (clobPrice != null) return { price: clobPrice, source: "clob" };
+  }
+  // Fall back to Gamma outcomePrices (YES = index 0)
+  if (market.outcomePrices) {
+    try {
+      const prices = typeof market.outcomePrices === "string"
+        ? JSON.parse(market.outcomePrices)
+        : market.outcomePrices;
+      const p = parseFloat(prices[0]);
+      if (!isNaN(p)) return { price: p, source: "gamma" };
+    } catch(e) {}
+  }
+  return null;
 }
 
 // Full scan for one station — pure function
@@ -139,13 +171,15 @@ async function scanStation(station, minEdge) {
     return q.includes(city) || q.includes(station.stationId.toLowerCase());
   }).slice(0, 8);
 
-  // 3. Fetch live prices
+  // 3. Fetch live prices — try CLOB then fall back to Gamma outcomePrices
   const priceMap = {};
+  const priceSourceMap = {};
   await Promise.all(markets.map(async m => {
-    const tid = m.clobTokenIds?.[0] || m.tokens?.[0]?.token_id;
-    if (tid) {
-      const price = await getPrice(tid);
-      if (price != null) priceMap[m.conditionId || m.id] = price;
+    const result = await getPriceWithFallback(m);
+    if (result) {
+      const key = m.conditionId || m.id;
+      priceMap[key]       = result.price;
+      priceSourceMap[key] = result.source;
     }
   }));
 
